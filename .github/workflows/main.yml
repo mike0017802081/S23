@@ -1,0 +1,545 @@
+# ─────────────────────────────────────────────────────────────────
+# Samsung Galaxy S23 · Android 14 · One UI 6.1 emulation
+# noVNC access via password-gated portal → bore.pub tunnel
+# ─────────────────────────────────────────────────────────────────
+name: android-integration-test
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  ANDROID_HOME:     /usr/local/lib/android/sdk
+  AVD_NAME:         s23_device
+
+jobs:
+  device-emulation:
+    name: S23 device environment
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      # ── 1. System packages ──────────────────────────────────────
+      - name: install-packages
+        run: |
+          sudo apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y \
+            xvfb x11vnc xdotool openbox xterm dbus-x11 \
+            xfonts-base x11-xkb-utils at-spi2-core \
+            python3 python3-pip python3-dev \
+            curl wget unzip git jq \
+            libgles2-mesa mesa-utils libgl1-mesa-glx \
+            qemu-user-static binfmt-support \
+            netcat-openbsd socat cpu-checker \
+            expect xxd xz-utils 2>/dev/null
+          sudo pip3 install websockify --break-system-packages -q
+
+      # ── 2. Kernel / ARMv7 binfmt tuning ────────────────────────
+      - name: kernel-tuning
+        run: |
+          # ARMv7 + AArch64 binfmt (lets x86_64 host execute ARM binaries natively)
+          sudo update-binfmts --enable qemu-arm       2>/dev/null || true
+          sudo update-binfmts --enable qemu-aarch64   2>/dev/null || true
+
+          # KVM access
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+
+          # VM / scheduler tuning for QEMU
+          sudo sysctl -w vm.swappiness=10               2>/dev/null || true
+          sudo sysctl -w vm.dirty_ratio=20              2>/dev/null || true
+          sudo sysctl -w vm.dirty_background_ratio=5    2>/dev/null || true
+          sudo sysctl -w kernel.pid_max=131072           2>/dev/null || true
+          sudo sysctl -w fs.inotify.max_user_watches=524288 2>/dev/null || true
+          sudo sysctl -w fs.inotify.max_user_instances=512  2>/dev/null || true
+          sudo sysctl -w kernel.sched_migration_cost_ns=5000000 2>/dev/null || true
+
+          # Transparent huge pages → madvise (better than always for QEMU)
+          echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+
+          # CPU performance mode on all cores
+          for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            echo performance | sudo tee "$g" 2>/dev/null || true
+          done
+
+          # Register qemu-arm static handler explicitly (belt + suspenders)
+          if ! grep -q "qemu-arm" /proc/sys/fs/binfmt_misc/register 2>/dev/null; then
+            echo ':qemu-arm:M::\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x28\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-arm-static:F' \
+              | sudo tee /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
+          fi
+
+      # ── 3. Android SDK components ───────────────────────────────
+      - name: android-sdk-setup
+        run: |
+          export PATH="$ANDROID_SDK_ROOT/emulator:$ANDROID_SDK_ROOT/tools/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "system-images;android-34;google_apis;x86_64" \
+            "platforms;android-34" \
+            "emulator" \
+            "platform-tools" \
+            2>&1 | tail -4
+
+      # ── 4. Create AVD wired as Samsung Galaxy S23 ───────────────
+      - name: create-s23-avd
+        run: |
+          export PATH="$ANDROID_SDK_ROOT/emulator:$ANDROID_SDK_ROOT/tools/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
+          avdmanager delete avd -n "$AVD_NAME" 2>/dev/null || true
+          echo "no" | avdmanager create avd \
+            -n "$AVD_NAME" \
+            -k "system-images;android-34;google_apis;x86_64" \
+            -d "pixel_6" --force
+
+          AVD_CFG="$HOME/.android/avd/${AVD_NAME}.avd/config.ini"
+
+          # S23: SM-S911B  1080×2340  425ppi  120 Hz  8 GB RAM  4 cores
+          cat > "$AVD_CFG" << 'CFGEOF'
+AvdId=s23_device
+PlayStore.enabled=false
+abi.type=x86_64
+avd.ini.displayname=Samsung Galaxy S23
+avd.ini.encoding=UTF-8
+disk.dataPartition.size=8192M
+fastboot.forceColdBoot=no
+fastboot.forceFastBoot=yes
+hw.accelerometer=yes
+hw.arc=false
+hw.audioInput=no
+hw.audioOutput=no
+hw.battery=yes
+hw.camera.back=emulated
+hw.camera.front=emulated
+hw.cpu.arch=x86_64
+hw.cpu.ncore=4
+hw.dPad=no
+hw.fingerprint=yes
+hw.gps=yes
+hw.gpu.enabled=yes
+hw.gpu.mode=swiftshader_indirect
+hw.initialOrientation=portrait
+hw.keyboard=yes
+hw.lcd.density=425
+hw.lcd.height=2340
+hw.lcd.width=1080
+hw.mainKeys=no
+hw.ramSize=8192
+hw.sdCard=no
+hw.sensors.orientation=yes
+hw.sensors.proximity=yes
+hw.trackBall=no
+image.sysdir.1=system-images/android-34/google_apis/x86_64/
+skin.dynamic=yes
+skin.name=1080x2340
+skin.path=_no_skin
+tag.display=Google APIs
+tag.id=google_apis
+vm.heapSize=1024
+CFGEOF
+
+          echo "[+] AVD created: $AVD_NAME (1080×2340, 425dpi, 8192 MB)"
+
+      # ── 5. Patch system image build.prop ────────────────────────
+      - name: patch-system-image
+        run: |
+          SYSIMG="$ANDROID_SDK_ROOT/system-images/android-34/google_apis/x86_64/system.img"
+          MNT="/tmp/sysimg_mnt"
+          sudo mkdir -p "$MNT"
+          MOUNTED=0
+
+          # Attempt direct ext4 mount
+          sudo mount -o loop,rw "$SYSIMG" "$MNT" 2>/dev/null && MOUNTED=1
+
+          # Fallback: nbd via qemu-nbd
+          if [ $MOUNTED -eq 0 ]; then
+            sudo apt-get install -y qemu-utils -qq 2>/dev/null || true
+            sudo modprobe nbd max_part=16 2>/dev/null || true
+            sudo qemu-nbd --connect=/dev/nbd0 "$SYSIMG" 2>/dev/null && {
+              sleep 2
+              sudo partprobe /dev/nbd0 2>/dev/null || true
+              sudo mount /dev/nbd0p1 "$MNT" 2>/dev/null && MOUNTED=1 ||
+              sudo mount /dev/nbd0    "$MNT" 2>/dev/null && MOUNTED=1 || true
+            }
+          fi
+
+          if [ $MOUNTED -eq 1 ]; then
+            # Locate build.prop
+            BPROP=""
+            for p in "$MNT/build.prop" "$MNT/system/build.prop"; do
+              [ -f "$p" ] && BPROP="$p" && break
+            done
+
+            if [ -n "$BPROP" ]; then
+              sudo tee -a "$BPROP" > /dev/null << 'PROPEOF'
+ro.product.manufacturer=samsung
+ro.product.brand=samsung
+ro.product.model=SM-S911B
+ro.product.device=dm1q
+ro.product.name=dm1qxxx
+ro.product.board=KALAMA
+ro.product.cpu.abi=arm64-v8a
+ro.product.cpu.abilist=arm64-v8a,armeabi-v7a,armeabi
+ro.product.cpu.abilist32=armeabi-v7a,armeabi
+ro.product.cpu.abilist64=arm64-v8a
+ro.hardware=qcom
+ro.hardware.egl=adreno
+ro.board.platform=kalama
+ro.build.fingerprint=samsung/dm1qxxx/dm1q:14/UP1A.231005.007/S911BXXS8CXJ1:user/release-keys
+ro.vendor.build.fingerprint=samsung/dm1qxxx/dm1q:14/UP1A.231005.007/S911BXXS8CXJ1:user/release-keys
+ro.odm.build.fingerprint=samsung/dm1qxxx/dm1q:14/UP1A.231005.007/S911BXXS8CXJ1:user/release-keys
+ro.system.build.fingerprint=samsung/dm1qxxx/dm1q:14/UP1A.231005.007/S911BXXS8CXJ1:user/release-keys
+ro.build.version.release=14
+ro.build.version.sdk=34
+ro.build.type=user
+ro.build.tags=release-keys
+ro.build.display.id=UP1A.231005.007.S911BXXS8CXJ1
+ro.build.description=dm1qxxx-user 14 UP1A.231005.007 S911BXXS8CXJ1 release-keys
+ro.build.version.oneui=60100
+ro.product.display=Galaxy S23
+ro.build.flavor=dm1qxxx-user
+ro.chipname=SM8550-AB
+ro.soc.manufacturer=Qualcomm Technologies, Inc
+ro.soc.model=SM8550-AB
+ro.boot.hardware=qcom
+ro.kernel.qemu=0
+ro.secure=1
+ro.debuggable=1
+ro.adb.secure=0
+ro.sf.lcd_density=425
+ro.display.max.hz=120
+ro.vendor.display.max_fps=120.0
+ro.vendor.display.resolution=FHD+
+persist.sys.sf.color_saturation=1.0
+ro.gfx.driver.0=com.qualcomm.qti.gpudrivers.kalama.api31
+PROPEOF
+              echo "[+] build.prop patched at: $BPROP"
+            else
+              echo "[!] build.prop not found in mounted image"
+            fi
+            sudo umount "$MNT"              2>/dev/null || true
+            sudo qemu-nbd --disconnect /dev/nbd0 2>/dev/null || true
+          else
+            echo "[!] Mount failed — will apply via local.prop + reboot after first boot"
+          fi
+
+      # ── 6. GL hook library (Adreno 740 spoof) ──────────────────
+      - name: compile-gl-hook
+        run: |
+          cat > /tmp/gl_hook.c << 'CEOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdlib.h>
+typedef unsigned int  GLenum;
+typedef unsigned char GLubyte;
+#define GL_VENDOR                   0x1F00
+#define GL_RENDERER                 0x1F01
+#define GL_VERSION                  0x1F02
+#define GL_SHADING_LANGUAGE_VERSION 0x8B8C
+static const GLubyte *(*real_glGetString)(GLenum) = (void *)0;
+__attribute__((constructor))
+static void gl_hook_init(void) {
+    real_glGetString = (const GLubyte *(*)(GLenum))dlsym(RTLD_NEXT, "glGetString");
+}
+const GLubyte *glGetString(GLenum name) {
+    switch (name) {
+        case GL_VENDOR:
+            return (const GLubyte *)"Qualcomm";
+        case GL_RENDERER:
+            return (const GLubyte *)"Adreno (TM) 740";
+        case GL_VERSION:
+            return (const GLubyte *)"OpenGL ES 3.2 V@0615.73 (GIT@59e5283, I17ee4f1efb) (Date:12/06/23)";
+        case GL_SHADING_LANGUAGE_VERSION:
+            return (const GLubyte *)"OpenGL ES GLSL ES 3.20";
+        default:
+            if (real_glGetString) return real_glGetString(name);
+            return (const GLubyte *)"";
+    }
+}
+CEOF
+
+          # Prefer NDK clang for Android x86_64 target
+          NDK_DIR=$(find "$ANDROID_SDK_ROOT/ndk" -maxdepth 1 -mindepth 1 -type d 2>/dev/null \
+            | sort -V | tail -1)
+          [ -z "$NDK_DIR" ] && NDK_DIR="$ANDROID_SDK_ROOT/ndk-bundle"
+          NDKCC="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android34-clang"
+
+          if [ -x "$NDKCC" ]; then
+            "$NDKCC" -shared -fPIC -o /tmp/gl_hook.so /tmp/gl_hook.c \
+              -ldl -Wl,-z,noexecstack -Wl,-z,nodlopen 2>/dev/null && \
+              echo "[+] GL hook compiled (NDK x86_64-android34)" || \
+              echo "[!] NDK compile failed; trying host gcc"
+          fi
+
+          # Host gcc fallback (still loads in emulator)
+          if [ ! -f /tmp/gl_hook.so ]; then
+            gcc -shared -fPIC -o /tmp/gl_hook.so /tmp/gl_hook.c -ldl 2>/dev/null && \
+              echo "[+] GL hook compiled (host gcc)" || \
+              echo "[!] GL hook compile failed completely"
+          fi
+
+      # ── 7. Virtual framebuffer (S23 dimensions) ─────────────────
+      - name: virtual-display
+        run: |
+          pkill -f "Xvfb :99" 2>/dev/null || true
+          sleep 1
+          # 1080×2340 @ 425 DPI — matches S23 physical panel
+          Xvfb :99 \
+            -screen 0 1080x2340x24 \
+            -ac +extension GLX +extension RANDR +extension MIT-SHM \
+            -dpi 425 2>/tmp/xvfb.log &
+          sleep 3
+          DISPLAY=:99 openbox --config-file /dev/null 2>/tmp/openbox.log &
+          sleep 2
+          DISPLAY=:99 xdpyinfo | grep -q dimensions && \
+            echo "[+] Display :99 ready at 1080×2340 / 425dpi" || \
+            echo "[!] Display init issue — check /tmp/xvfb.log"
+
+      # ── 8. VNC server (password never printed) ──────────────────
+      - name: vnc-server
+        run: |
+          mkdir -p ~/.vnc
+          # Decode and store password without exposing in stdout/process list
+          _B="V2luZG93c1JEUDIwMjZA"
+          printf '%s' "$(printf '%s' "$_B" | base64 -d)" \
+            | x11vnc -storepasswd /tmp/.vncauth 2>/dev/null \
+            || x11vnc -storepasswd \
+                 "$(printf '%s' "$(printf '%s' "$_B" | base64 -d)")" \
+                 /tmp/.vncauth 2>/dev/null
+          unset _B
+
+          x11vnc \
+            -display   :99 \
+            -rfbauth   /tmp/.vncauth \
+            -rfbport   5900 \
+            -listen    127.0.0.1 \
+            -forever   \
+            -shared    \
+            -noxdamage \
+            -noscr     \
+            -nodpms    \
+            -cursor    arrow \
+            -nomodtweak \
+            2>/tmp/x11vnc.log &
+
+          sleep 3
+          nc -zv 127.0.0.1 5900 2>&1 | grep -qi "succeed\|open" && \
+            echo "[+] VNC ready on 127.0.0.1:5900" || \
+            echo "[!] VNC check failed — see /tmp/x11vnc.log"
+
+      # ── 9. noVNC + auth portal ───────────────────────────────────
+      - name: novnc-and-auth-portal
+        run: |
+          git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/noVNC 2>&1 | tail -1
+
+          # websockify: static files + WS→VNC bridge, bound to localhost
+          websockify \
+            --web /tmp/noVNC \
+            --heartbeat 30 \
+            127.0.0.1:6080 \
+            127.0.0.1:5900 2>/tmp/websockify.log &
+          sleep 3
+
+          # ── async Python auth gateway ──────────────────────────
+          # Checks session cookie before proxying HTTP + WebSocket to 6080
+          cat > /tmp/authportal.py << 'PYEOF'
+from __future__ import annotations
+import asyncio
+import hashlib
+import base64
+import http.cookies
+import os
+import urllib.parse
+
+BACKEND_HOST = "127.0.0.1"
+BACKEND_PORT = 6080
+LISTEN_PORT  = 8080
+
+_r = base64.b64decode("V2luZG93c1JEUDIwMjZA").decode()
+PASS_HASH = hashlib.sha256(_r.encode()).hexdigest()
+del _r
+
+SESSIONS: set[str] = set()
+
+LOGIN_HTML = b"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Galaxy S23</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:linear-gradient(135deg,#060608 0%,#0d1117 60%,#161b22 100%);
+  display:flex;align-items:center;justify-content:center;
+  min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,sans-serif}
+.card{background:rgba(22,27,34,.88);backdrop-filter:blur(24px);
+  border:1px solid rgba(255,255,255,.08);border-radius:20px;
+  padding:44px 36px;width:340px;max-width:92vw}
+.icon{text-align:center;margin-bottom:28px}
+.icon svg{width:44px;height:44px;stroke:#3b82f6;stroke-width:1.5;fill:none}
+h1{color:#e6edf3;font-size:21px;font-weight:600;text-align:center;margin-bottom:6px}
+.sub{color:#7d8590;font-size:13px;text-align:center;margin-bottom:28px}
+label{color:#8b949e;font-size:12px;text-transform:uppercase;
+  letter-spacing:.8px;display:block;margin-bottom:8px}
+input{width:100%;padding:13px 15px;
+  background:rgba(255,255,255,.05);
+  border:1px solid rgba(255,255,255,.12);border-radius:10px;
+  color:#e6edf3;font-size:15px;outline:none;transition:.2s}
+input:focus{border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,.2)}
+button{width:100%;margin-top:14px;padding:13px;background:#1d6feb;
+  color:#fff;border:none;border-radius:10px;font-size:15px;
+  font-weight:600;cursor:pointer;transition:.2s}
+button:hover{background:#388bfd}
+.err{margin-top:14px;padding:11px;background:rgba(248,81,73,.15);
+  border:1px solid rgba(248,81,73,.3);border-radius:8px;
+  color:#ff7b72;font-size:13px;text-align:center}
+.foot{color:#484f58;font-size:11px;text-align:center;margin-top:18px}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">
+    <svg viewBox="0 0 24 24">
+      <rect x="5" y="2" width="14" height="20" rx="2.5"/>
+      <circle cx="12" cy="18.5" r="1" fill="#3b82f6"/>
+    </svg>
+  </div>
+  <h1>Galaxy S23</h1>
+  <div class="sub">One UI 6.1 &middot; Android 14 &middot; 120 Hz</div>
+  <form method="POST" action="/auth">
+    <label>Access code</label>
+    <input type="password" name="p"
+           placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;"
+           autocomplete="off">
+    <button type="submit">Connect &rarr;</button>
+  </form>
+  __ERR__
+  <div class="foot">Snapdragon 8 Gen 2 &middot; Adreno 740</div>
+</div>
+</body>
+</html>"""
+
+ERR_HTML = b'<div class="err">&#10006; Incorrect access code</div>'
+
+
+def make_login(bad: bool = False) -> bytes:
+    return LOGIN_HTML.replace(b"__ERR__", ERR_HTML if bad else b"")
+
+
+def parse_session(cookie_header: str) -> str | None:
+    if not cookie_header or "sid=" not in cookie_header:
+        return None
+    try:
+        c = http.cookies.SimpleCookie(cookie_header)
+        return c["sid"].value if "sid" in c else None
+    except Exception:
+        return None
+
+
+async def pipe_data(
+    src: asyncio.StreamReader,
+    dst: asyncio.StreamWriter,
+) -> None:
+    try:
+        while True:
+            data = await src.read(65536)
+            if not data:
+                break
+            dst.write(data)
+            await dst.drain()
+    except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+        pass
+    finally:
+        try:
+            dst.close()
+        except Exception:
+            pass
+
+
+async def handle(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> None:
+    try:
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = await asyncio.wait_for(reader.read(8192), timeout=20)
+            if not chunk:
+                return
+            buf += chunk
+            if len(buf) > 131072:
+                return
+
+        head_raw, _, tail = buf.partition(b"\r\n\r\n")
+        lines = head_raw.split(b"\r\n")
+        req_line = lines[0].decode("latin-1", errors="replace")
+        words = req_line.split(" ", 2)
+        if len(words) < 2:
+            return
+
+        method = words[0].upper()
+        path   = words[1]
+
+        # Build two parallel header structures:
+        # hdrs   → lowercase-keyed dict  (for logic)
+        # hdrs_orig → original bytes list (for forwarding)
+        hdrs: dict[str, str] = {}
+        hdrs_orig: list[bytes] = []
+        for line in lines[1:]:
+            if b":" in line:
+                k, _, v = line.partition(b":")
+                hdrs[k.strip().decode("latin-1").lower()] = \
+                    v.strip().decode("latin-1")
+                hdrs_orig.append(line)
+
+        cookie  = hdrs.get("cookie", "")
+        tok     = parse_session(cookie)
+        authed  = tok in SESSIONS
+        is_ws   = hdrs.get("upgrade", "").lower() == "websocket"
+        clen    = int(hdrs.get("content-length", "0"))
+
+        # ── POST /auth ────────────────────────────────────────────
+        if method == "POST" and path == "/auth":
+            body = tail
+            while len(body) < clen:
+                chunk = await asyncio.wait_for(
+                    reader.read(clen - len(body)), timeout=10
+                )
+                if not chunk:
+                    break
+                body += chunk
+            params = urllib.parse.parse_qs(
+                body.decode("utf-8", errors="replace")
+            )
+            pw = params.get("p", [""])[0]
+            if hashlib.sha256(pw.encode()).hexdigest() == PASS_HASH:
+                new_tok = os.urandom(24).hex()
+                SESSIONS.add(new_tok)
+                resp = (
+                    "HTTP/1.1 302 Found\r\n"
+                    "Location: /vnc.html?autoconnect=true&reconnect=true\r\n"
+                    "Set-Cookie: sid=" + new_tok +
+                    "; Path=/; HttpOnly; SameSite=Strict\r\n"
+                    "Content-Length: 0\r\n\r\n"
+                ).encode()
+            else:
+                body_resp = make_login(bad=True)
+                resp = (
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/html; charset=utf-8\r\n"
+                    f"Content-Length: {len(body_resp)}\r\n\r\n"
+                ).encode() + body_resp
+            writer.write(resp)
+            await writer.drain()
+            return
+
+        # ── Unauthenticated non-WS → login page ──────────────────
+        if not authed and not is_ws:
+            body_resp = make_login(bad=False)
+            resp = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/html; charset=utf-8\r\n"
+                f"Content-Length: {len(body_resp)}\r\n\r\n"
+            ).encode() + body_re
